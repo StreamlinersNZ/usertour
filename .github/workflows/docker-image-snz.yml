@@ -1,0 +1,117 @@
+# Publishes our patched image to the SNZ private ECR repo.
+#
+# A copy of `docker-image.yml` rather than an edit of it: that file is upstream's
+# and is actively maintained, so editing it would conflict on every sync. This
+# filename will never exist upstream, so it cannot conflict.
+#
+# Upstream's workflow triggers on `v*`; our tags deliberately omit the leading
+# `v` (e.g. `0.9.0-snz.1`), so pushing a release tag runs only this workflow.
+#
+# NOTE: this repository is PUBLIC (a fork of a public repo cannot be private),
+# and run logs on public repos are world-readable. The role ARN is therefore a
+# repository *secret* rather than a variable, so GitHub masks it in logs, and
+# the registry host is derived from the ecr-login output instead of inlined.
+# (The account id still appears via the ECR push target, and neither value is a
+# credential — the ARN is unusable without the OIDC trust matching this org.)
+name: Publish Docker Image (SNZ ECR)
+
+# To publish from a branch WITHOUT merging, push a tag on that branch — tag
+# triggers are not branch-scoped, so the workflow runs from the tagged commit's
+# own tree. `workflow_dispatch` below only becomes available once this file is
+# on the default branch (a GitHub requirement), after which you can dispatch it
+# against any ref.
+on:
+  push:
+    tags: ['*-snz.*']
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to publish, e.g. 0.9.0-snz.1 (append -rcN for throwaway test builds)'
+        required: true
+        type: string
+
+permissions:
+  id-token: write # OIDC federation into AWS
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-2
+  ECR_REPOSITORY: usertour
+
+jobs:
+  push_to_ecr:
+    name: Push Docker image to SNZ ECR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Resolve image tag and upstream base
+        id: version
+        # Read the dispatch input through the environment rather than
+        # interpolating it into the script, so a hand-typed value can't inject
+        # shell.
+        env:
+          INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          # On a tag push the git tag IS the image tag — no translation, so an
+          # image always traces back to a commit. A manual dispatch has no
+          # usable ref name (it would be the branch), so it supplies the tag.
+          TAG="${INPUT_IMAGE_TAG:-${GITHUB_REF_NAME}}"
+
+          # Guard against a typo'd manual input becoming a junk image tag, and
+          # keep the `-snz.` marker that stops us ever colliding with an
+          # upstream version.
+          if [[ ! "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+-snz\.[0-9A-Za-z.-]+$ ]]; then
+            echo "Refusing to publish: tag '$TAG' must look like <upstream-version>-snz.<revision>, e.g. 0.9.0-snz.1"
+            exit 1
+          fi
+
+          # `0.9.0-snz.1` -> base `0.9.0`, recorded as a label so
+          # `docker inspect` shows which upstream release we patched.
+          UPSTREAM="${TAG%%-snz.*}"
+          echo "Image tag: $TAG"
+          echo "Upstream base: $UPSTREAM"
+          echo "IMAGE_TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "UPSTREAM_VERSION=$UPSTREAM" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: github_via_oidc
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to AWS ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        id: docker_build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          # Fargate runs X86_64 (SnzFargateTaskDefinition sets no
+          # runtimePlatform, so CDK defaults to it) — a single-arch build keeps
+          # release times down and needs no QEMU emulation.
+          platforms: linux/amd64
+          push: true
+          # No `:latest` — the CDK stack pins an exact tag for reproducible
+          # deploys, and a floating tag invites accidental drift.
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.IMAGE_TAG }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.IMAGE_TAG }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            nz.streamliners.usertour.upstream-version=${{ steps.version.outputs.UPSTREAM_VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image digest
+        run: echo ${{ steps.docker_build.outputs.digest }}
