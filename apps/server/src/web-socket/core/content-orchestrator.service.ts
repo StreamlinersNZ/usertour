@@ -1389,7 +1389,7 @@ export class ContentOrchestratorService {
    * @returns True if the session was activated successfully
    */
   private async activateOtherSocketSession(params: ActivateSessionParams) {
-    const { socket } = params;
+    const { socket, session } = params;
     const lockKey = buildSocketLockKey(socket);
 
     return (
@@ -1398,6 +1398,12 @@ export class ContentOrchestratorService {
         async () => {
           const socketData = await this.getSocketData(socket);
           if (!socketData) {
+            return false;
+          }
+          // The originating socket's evaluation says nothing about where the
+          // other tabs are, so re-check against this socket's own page context
+          // before delivering.
+          if (!(await this.isActivationAllowedOnSocket(socketData, session))) {
             return false;
           }
           return await this.activateSocketSession({
@@ -1410,6 +1416,48 @@ export class ContentOrchestratorService {
         5000, // Lock timeout 5 seconds
       )) ?? false
     );
+  }
+
+  /**
+   * Whether a session may be activated on another socket, judged by that
+   * socket's own page context rather than the originating socket's.
+   *
+   * `activateSocketSession` delivers the originating session verbatim, so
+   * without this check a hide rule excluding the target tab's page is silently
+   * bypassed: an already-open tab keeps showing content it would never be sent
+   * on a fresh load. Applies to every content type, since the check sits above
+   * the type dispatch.
+   *
+   * Gates on hide rules only. Requiring auto-start rules to match here would
+   * break legitimate multi-page flows, which continue onto pages their start
+   * rules never matched.
+   *
+   * @param socketData - The target socket's data, carrying its own clientContext
+   * @param session - The session being activated
+   * @returns True when activation may proceed
+   */
+  private async isActivationAllowedOnSocket(
+    socketData: SocketData,
+    session: CustomContentSession,
+  ): Promise<boolean> {
+    const evaluatedVersion = await this.findEvaluatedContentVersion(
+      socketData,
+      session.content.type as ContentDataType,
+      session.version.id,
+    );
+
+    // Unresolvable context (e.g. the version isn't available to this socket's
+    // company scope) fails closed: skip the push rather than deliver content
+    // whose conditions could not be checked. The tab picks it up on its next
+    // message, which goes through the evaluating path.
+    if (!evaluatedVersion) {
+      this.logger.debug(
+        `Skipping cross-socket activation, version ${session.version.id} not available for this socket`,
+      );
+      return false;
+    }
+
+    return !isActivedHideRules(evaluatedVersion);
   }
 
   /**
