@@ -27,8 +27,13 @@ import {
  * bypassed: an already-open tab shows content it would never be sent on a fresh
  * load. Covers flows and banners, since the leak is above the content-type
  * dispatch.
+ *
+ * Show-only content (banners) has no hide rules to author, so its visibility
+ * rests on its show rules holding on the current page — the fan-out gates on
+ * those instead. Flows deliberately keep the looser hide-rules-only gate,
+ * because a multi-page flow continues onto pages its start rules never matched.
  */
-describe('WebSocket v2 cross-socket activation honours hide rules (e2e)', () => {
+describe('WebSocket v2 cross-socket activation honours per-socket page conditions (e2e)', () => {
   let harness: WebSocketTestApp;
   let prisma: PrismaService;
   let projectId: string;
@@ -43,6 +48,8 @@ describe('WebSocket v2 cross-socket activation honours hide rules (e2e)', () => 
 
   let flowContentId: string;
   let bannerContentId: string;
+  let showRulesBannerContentId: string;
+  let showRulesFlowContentId: string;
 
   const openClients: WebSocketTestClient[] = [];
 
@@ -75,6 +82,36 @@ describe('WebSocket v2 cross-socket activation honours hide rules (e2e)', () => 
     ],
     autoStartRulesSetting: {},
     hideRulesSetting: {},
+  });
+
+  /**
+   * "Show only on the app pages" — the condition activates on ALLOWED_PAGE and
+   * OTHER_ALLOWED_PAGE, never on HIDDEN_PAGE. Carries no hide rules, so a page
+   * is excluded solely by failing to satisfy the show rules.
+   */
+  const showOnAppPagesConfig = () => ({
+    enabledAutoStartRules: true,
+    enabledHideRules: false,
+    autoStartRules: [
+      {
+        id: 'show-on-app-pages',
+        type: RulesType.CURRENT_PAGE,
+        operators: 'and' as const,
+        data: { includes: ['**/app**', '**/dashboard**'], excludes: [] },
+      },
+    ],
+    hideRules: [],
+    autoStartRulesSetting: {},
+    hideRulesSetting: {},
+  });
+
+  const bannerData = () => ({
+    embedPlacement: 'top-of-page',
+    overlayEmbedOverAppContent: false,
+    stickToTopOfViewport: true,
+    allowUsersToDismissEmbed: true,
+    animateWhenEmbedAppears: false,
+    contents: [],
   });
 
   beforeAll(async () => {
@@ -124,19 +161,57 @@ describe('WebSocket v2 cross-socket activation honours hide rules (e2e)', () => 
       contentId: bannerContent.id,
       sequence: 1,
       config: hideOnCheckoutConfig(),
-      data: {
-        embedPlacement: 'top-of-page',
-        overlayEmbedOverAppContent: false,
-        stickToTopOfViewport: true,
-        allowUsersToDismissEmbed: true,
-        animateWhenEmbedAppears: false,
-        contents: [],
-      },
+      data: bannerData(),
     });
     await publishVersion(prisma, {
       environmentId,
       contentId: bannerContent.id,
       versionId: bannerVersion.id,
+    });
+
+    const showRulesBannerContent = await buildContent(prisma, {
+      projectId,
+      environmentId,
+      name: 'ws-cross-socket-show-rules-banner',
+      type: 'banner',
+    });
+    showRulesBannerContentId = showRulesBannerContent.id;
+    const showRulesBannerVersion = await buildVersion(prisma, {
+      contentId: showRulesBannerContent.id,
+      sequence: 1,
+      config: showOnAppPagesConfig(),
+      data: bannerData(),
+    });
+    await publishVersion(prisma, {
+      environmentId,
+      contentId: showRulesBannerContent.id,
+      versionId: showRulesBannerVersion.id,
+    });
+
+    // Same show-rules config on a flow, to pin the content-type asymmetry.
+    const showRulesFlowContent = await buildContent(prisma, {
+      projectId,
+      environmentId,
+      name: 'ws-cross-socket-show-rules-flow',
+      type: 'flow',
+    });
+    showRulesFlowContentId = showRulesFlowContent.id;
+    const showRulesFlowVersion = await buildVersion(prisma, {
+      contentId: showRulesFlowContent.id,
+      sequence: 1,
+      config: showOnAppPagesConfig(),
+      data: [],
+    });
+    await buildStep(prisma, {
+      versionId: showRulesFlowVersion.id,
+      sequence: 0,
+      name: 'Show Rules Flow Step',
+      data: [],
+    });
+    await publishVersion(prisma, {
+      environmentId,
+      contentId: showRulesFlowContent.id,
+      versionId: showRulesFlowVersion.id,
     });
   }, 60000);
 
@@ -199,5 +274,59 @@ describe('WebSocket v2 cross-socket activation honours hide rules (e2e)', () => 
     await expect(
       hiddenTab.waitForServerMessage(ServerMessageKind.SET_BANNER_SESSION, 1500),
     ).rejects.toThrow(/Timed out/);
+  });
+
+  it('does not activate a banner on another socket whose show rules do not match its page', async () => {
+    const hiddenTab = await connectOnPage(HIDDEN_PAGE);
+    const startingTab = await connectOnPage(ALLOWED_PAGE);
+
+    const ack = await startingTab.sendClientMessage(ClientMessageKind.START_CONTENT, {
+      contentId: showRulesBannerContentId,
+      startReason: 'start_from_manual',
+    });
+    expect(ack).toBe(true);
+    await startingTab.waitForServerMessage(ServerMessageKind.SET_BANNER_SESSION);
+
+    // A banner is only ever visible while its show rules hold, so a tab those
+    // rules do not reach must not be pushed the session.
+    await expect(
+      hiddenTab.waitForServerMessage(ServerMessageKind.SET_BANNER_SESSION, 1500),
+    ).rejects.toThrow(/Timed out/);
+  });
+
+  it('still activates a banner on another socket whose page matches its show rules', async () => {
+    const otherAllowedTab = await connectOnPage(OTHER_ALLOWED_PAGE);
+    const startingTab = await connectOnPage(ALLOWED_PAGE);
+
+    const ack = await startingTab.sendClientMessage(ClientMessageKind.START_CONTENT, {
+      contentId: showRulesBannerContentId,
+      startReason: 'start_from_manual',
+    });
+    expect(ack).toBe(true);
+
+    await expect(
+      otherAllowedTab.waitForServerMessage(ServerMessageKind.SET_BANNER_SESSION),
+    ).resolves.toMatchObject({ kind: ServerMessageKind.SET_BANNER_SESSION });
+  });
+
+  // Characterisation test: pins the deliberate asymmetry between content types.
+  // Flows are gated on hide rules only, so unmatched start rules do not block
+  // the fan-out. Passes with or without the show-only gate; it fails if a future
+  // change extends that gate to every content type.
+  it('still activates a flow on another socket whose page does not match its start rules', async () => {
+    const hiddenTab = await connectOnPage(HIDDEN_PAGE);
+    const startingTab = await connectOnPage(ALLOWED_PAGE);
+
+    const ack = await startingTab.sendClientMessage(ClientMessageKind.START_CONTENT, {
+      contentId: showRulesFlowContentId,
+      startReason: 'start_from_manual',
+    });
+    expect(ack).toBe(true);
+
+    // Multi-page flows legitimately continue onto pages their start rules never
+    // matched, so the tab on the unmatched page still receives the session.
+    await expect(
+      hiddenTab.waitForServerMessage(ServerMessageKind.SET_FLOW_SESSION),
+    ).resolves.toMatchObject({ kind: ServerMessageKind.SET_FLOW_SESSION });
   });
 });
