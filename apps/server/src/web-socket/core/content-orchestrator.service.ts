@@ -1432,6 +1432,12 @@ export class ContentOrchestratorService {
    * break legitimate multi-page flows, which continue onto pages their start
    * rules never matched.
    *
+   * Show-only types (banners) are the exception: they have no hide rules to
+   * author, and `handleExistingSession` re-checks their show rules on every
+   * toggle, so their visibility is defined by those rules holding on the
+   * current page. The fan-out honours the same invariant — the multi-page-flow
+   * rationale does not apply to content that never advances past one page.
+   *
    * @param socketData - The target socket's data, carrying its own clientContext
    * @param session - The session being activated
    * @returns True when activation may proceed
@@ -1440,9 +1446,10 @@ export class ContentOrchestratorService {
     socketData: SocketData,
     session: CustomContentSession,
   ): Promise<boolean> {
+    const contentType = session.content.type as ContentDataType;
     const evaluatedVersion = await this.findEvaluatedContentVersion(
       socketData,
-      session.content.type as ContentDataType,
+      contentType,
       session.version.id,
     );
 
@@ -1453,6 +1460,13 @@ export class ContentOrchestratorService {
     if (!evaluatedVersion) {
       this.logger.debug(
         `Skipping cross-socket activation, version ${session.version.id} not available for this socket`,
+      );
+      return false;
+    }
+
+    if (isShowOnlyContentType(contentType) && !isActivedAutoStartRules(evaluatedVersion)) {
+      this.logger.debug(
+        `Skipping cross-socket activation, show rules for version ${session.version.id} not active on this socket`,
       );
       return false;
     }
