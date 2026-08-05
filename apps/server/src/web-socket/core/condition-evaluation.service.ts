@@ -147,6 +147,38 @@ export class ConditionEvaluationService {
   }
 
   /**
+   * Whether `conditions` reach for company or membership data that `context`
+   * cannot resolve — it names no company, or no membership binds the user to
+   * the one it names.
+   *
+   * Evaluation reads an unresolvable company as "not matched", which is the
+   * right answer wherever a condition grants something: content whose audience
+   * cannot be confirmed must not start. Conditions that withhold instead — hide
+   * rules — invert that reading, so the same "not matched" becomes permission
+   * to show content the rule exists to suppress. Callers in that position ask
+   * this first and decline to act on an evaluation they know is uninformed.
+   *
+   * @param conditions - The conditions about to be read
+   * @param context - Condition evaluation context
+   * @returns True when the answer would rest on company context that is missing
+   */
+  async hasUnresolvableCompanyScopedConditions(
+    conditions: RulesCondition[] | undefined,
+    context: ConditionEvaluationContext,
+  ): Promise<boolean> {
+    if (!conditions?.length || !(await this.hasCompanyScopedCondition(conditions, context))) {
+      return false;
+    }
+
+    if (!context.externalCompanyId) {
+      return true;
+    }
+
+    const userOnCompany = await this.findUserCompanyRelation(context);
+    return !userOnCompany?.bizCompany;
+  }
+
+  /**
    * Evaluate checklist conditions and return updated items
    * @param data - Checklist data containing items and conditions
    * @param context - Condition evaluation context
@@ -638,6 +670,102 @@ export class ConditionEvaluationService {
       BizEvents.CHECKLIST_COMPLETED,
     ]);
     return logic === ContentConditionLogic.COMPLETED ? hasCompleted : !hasCompleted;
+  }
+
+  // ============================================================================
+  // Private: Company Scope Detection
+  // ============================================================================
+
+  /**
+   * Whether any leaf in the tree reads company or membership data — directly
+   * through a company / membership attribute, or through a segment that does.
+   *
+   * `seenSegmentIds` carries the segments already being walked: a segment tree
+   * may reference one of them again, and a revisit can never add scope, so it
+   * is skipped rather than recursed — which also keeps a cyclic segment
+   * reference from recursing without end.
+   */
+  private async hasCompanyScopedCondition(
+    conditions: RulesCondition[],
+    context: ConditionEvaluationContext,
+    seenSegmentIds: Set<string> = new Set(),
+  ): Promise<boolean> {
+    for (const condition of conditions) {
+      if (condition.type === RulesType.GROUP) {
+        if (
+          condition.conditions &&
+          (await this.hasCompanyScopedCondition(condition.conditions, context, seenSegmentIds))
+        ) {
+          return true;
+        }
+        continue;
+      }
+
+      if (condition.type === RulesType.USER_ATTR) {
+        if (this.isCompanyScopedAttribute(condition.data?.attrId, context)) {
+          return true;
+        }
+        continue;
+      }
+
+      if (
+        condition.type === RulesType.SEGMENT &&
+        (await this.isCompanyScopedSegment(condition, context, seenSegmentIds))
+      ) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Company and membership attributes are the two bizTypes whose values live
+   * behind the user's membership in the current company.
+   */
+  private isCompanyScopedAttribute(
+    attrId: string | undefined,
+    context: ConditionEvaluationContext,
+  ): boolean {
+    const attr = context.attributes.find((candidate) => candidate.id === attrId);
+    return (
+      attr?.bizType === AttributeBizType.COMPANY || attr?.bizType === AttributeBizType.MEMBERSHIP
+    );
+  }
+
+  /**
+   * A company segment is company-scoped by definition — it can only be judged
+   * against the session's current company. A user segment is too when its own
+   * conditions reach into company or membership attributes, since at runtime
+   * those leaves are bound to that same company.
+   */
+  private async isCompanyScopedSegment(
+    condition: RulesCondition,
+    context: ConditionEvaluationContext,
+    seenSegmentIds: Set<string>,
+  ): Promise<boolean> {
+    const { segmentId } = condition.data ?? {};
+    if (!segmentId || seenSegmentIds.has(segmentId)) {
+      return false;
+    }
+    seenSegmentIds.add(segmentId);
+
+    const segment = await this.findSegmentById(segmentId);
+    if (!segment) {
+      return false;
+    }
+
+    if (segment.bizType === SegmentBizType.COMPANY) {
+      return true;
+    }
+
+    return isArray(segment.data)
+      ? await this.hasCompanyScopedCondition(
+          segment.data as RulesCondition[],
+          context,
+          seenSegmentIds,
+        )
+      : false;
   }
 
   // ============================================================================

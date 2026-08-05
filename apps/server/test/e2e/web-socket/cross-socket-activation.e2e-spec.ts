@@ -3,6 +3,7 @@ import { ClientMessageKind, RulesType, ServerMessageKind } from '@usertour/types
 
 import { initialization } from '@/common/initialization/initialization';
 import {
+  buildAttribute,
   buildContent,
   buildEnvironment,
   buildProject,
@@ -32,6 +33,13 @@ import {
  * rests on its show rules holding on the current page — the fan-out gates on
  * those instead. Flows deliberately keep the looser hide-rules-only gate,
  * because a multi-page flow continues onto pages its start rules never matched.
+ *
+ * A socket's company is part of that per-socket context too. Company-scoped
+ * conditions evaluate to false when the receiving socket's company cannot be
+ * resolved — no company yet, or no membership binding the user to the one it
+ * names — and read as a hide rule that false means "do not hide". The fan-out
+ * must therefore treat an unresolvable company as a reason to skip, not as
+ * permission to deliver; the tab re-evaluates for itself on its next message.
  */
 describe('WebSocket v2 cross-socket activation honours per-socket page conditions (e2e)', () => {
   let harness: WebSocketTestApp;
@@ -41,6 +49,8 @@ describe('WebSocket v2 cross-socket activation honours per-socket page condition
   let environmentToken: string;
 
   const externalUserId = `ws-cross-socket-user-${Date.now()}`;
+  const chpExternalCompanyId = `ws-cross-socket-chp-${Date.now()}`;
+  const hhpExternalCompanyId = `ws-cross-socket-hhp-${Date.now()}`;
 
   const ALLOWED_PAGE = 'https://example.test/app';
   const OTHER_ALLOWED_PAGE = 'https://example.test/dashboard';
@@ -50,6 +60,7 @@ describe('WebSocket v2 cross-socket activation honours per-socket page condition
   let bannerContentId: string;
   let showRulesBannerContentId: string;
   let showRulesFlowContentId: string;
+  let companyHideRulesFlowContentId: string;
 
   const openClients: WebSocketTestClient[] = [];
 
@@ -63,6 +74,34 @@ describe('WebSocket v2 cross-socket activation honours per-socket page condition
     openClients.push(client);
     return client;
   };
+
+  /**
+   * The SDK's group() call: binds this socket to a company and upserts the
+   * company's attributes plus the user's membership in it. A socket that never
+   * sends it has no company at all — the state every connection starts in.
+   */
+  const groupTo = async (
+    client: WebSocketTestClient,
+    externalCompanyId: string,
+    publicationCode: string,
+  ) => {
+    const ack = await client.sendClientMessage(ClientMessageKind.UPSERT_COMPANY, {
+      externalUserId,
+      externalCompanyId,
+      attributes: { publicationCode },
+      membership: {},
+    });
+    expect(ack).toBe(true);
+  };
+
+  /** Remove the user's membership in a company, leaving the BizUser in place. */
+  const severMembership = (externalCompanyId: string) =>
+    prisma.bizUserOnCompany.deleteMany({
+      where: {
+        bizUser: { externalId: externalUserId, environmentId },
+        bizCompany: { externalId: externalCompanyId, environmentId },
+      },
+    });
 
   /**
    * "Hide on the checkout page" — the condition activates (and therefore
@@ -101,6 +140,28 @@ describe('WebSocket v2 cross-socket activation honours per-socket page condition
       },
     ],
     hideRules: [],
+    autoStartRulesSetting: {},
+    hideRulesSetting: {},
+  });
+
+  /**
+   * "Hide anywhere but the chp publication" — the condition activates (and
+   * therefore hides) for every company whose publicationCode is something
+   * else, and carries no page rules, so the only thing gating delivery is the
+   * receiving socket's company.
+   */
+  const hideOutsideChpConfig = (attrId: string) => ({
+    enabledAutoStartRules: false,
+    enabledHideRules: true,
+    autoStartRules: [],
+    hideRules: [
+      {
+        id: 'hide-outside-chp',
+        type: RulesType.USER_ATTR,
+        operators: 'and' as const,
+        data: { attrId, logic: 'not', value: 'chp' },
+      },
+    ],
     autoStartRulesSetting: {},
     hideRulesSetting: {},
   });
@@ -212,6 +273,42 @@ describe('WebSocket v2 cross-socket activation honours per-socket page condition
       environmentId,
       contentId: showRulesFlowContent.id,
       versionId: showRulesFlowVersion.id,
+    });
+
+    // Created before the first connection: the project's attribute list is
+    // cached on first evaluation, so an attribute added later is invisible to
+    // condition evaluation for the rest of the suite.
+    const publicationCodeAttribute = await buildAttribute(prisma, {
+      projectId,
+      codeName: 'publicationCode',
+      displayName: 'Publication Code',
+      bizType: 2,
+      dataType: 2,
+    });
+
+    const companyHideRulesFlowContent = await buildContent(prisma, {
+      projectId,
+      environmentId,
+      name: 'ws-cross-socket-company-hide-rules-flow',
+      type: 'flow',
+    });
+    companyHideRulesFlowContentId = companyHideRulesFlowContent.id;
+    const companyHideRulesFlowVersion = await buildVersion(prisma, {
+      contentId: companyHideRulesFlowContent.id,
+      sequence: 1,
+      config: hideOutsideChpConfig(publicationCodeAttribute.id),
+      data: [],
+    });
+    await buildStep(prisma, {
+      versionId: companyHideRulesFlowVersion.id,
+      sequence: 0,
+      name: 'Company Hide Rules Flow Step',
+      data: [],
+    });
+    await publishVersion(prisma, {
+      environmentId,
+      contentId: companyHideRulesFlowContent.id,
+      versionId: companyHideRulesFlowVersion.id,
     });
   }, 60000);
 
@@ -327,6 +424,89 @@ describe('WebSocket v2 cross-socket activation honours per-socket page condition
     // matched, so the tab on the unmatched page still receives the session.
     await expect(
       hiddenTab.waitForServerMessage(ServerMessageKind.SET_FLOW_SESSION),
+    ).resolves.toMatchObject({ kind: ServerMessageKind.SET_FLOW_SESSION });
+  });
+
+  it('does not activate a flow on another socket whose company fails its hide rules', async () => {
+    const hhpTab = await connectOnPage(ALLOWED_PAGE);
+    await groupTo(hhpTab, hhpExternalCompanyId, 'hhp');
+    const startingTab = await connectOnPage(ALLOWED_PAGE);
+    await groupTo(startingTab, chpExternalCompanyId, 'chp');
+
+    const ack = await startingTab.sendClientMessage(ClientMessageKind.START_CONTENT, {
+      contentId: companyHideRulesFlowContentId,
+      startReason: 'start_from_manual',
+    });
+    expect(ack).toBe(true);
+
+    // The originating tab is in the chp company, which the hide rules allow.
+    await startingTab.waitForServerMessage(ServerMessageKind.SET_FLOW_SESSION);
+
+    // The tab in another publication's company must not be pushed the session.
+    await expect(
+      hhpTab.waitForServerMessage(ServerMessageKind.SET_FLOW_SESSION, 1500),
+    ).rejects.toThrow(/Timed out/);
+  });
+
+  it('does not activate a flow with company-scoped hide rules on a socket with no company', async () => {
+    // A tab between identify() and group() — and any site whose group() call
+    // fails — has no company for the hide rules to be judged against.
+    const noCompanyTab = await connectOnPage(ALLOWED_PAGE);
+    const startingTab = await connectOnPage(ALLOWED_PAGE);
+    await groupTo(startingTab, chpExternalCompanyId, 'chp');
+
+    const ack = await startingTab.sendClientMessage(ClientMessageKind.START_CONTENT, {
+      contentId: companyHideRulesFlowContentId,
+      startReason: 'start_from_manual',
+    });
+    expect(ack).toBe(true);
+    await startingTab.waitForServerMessage(ServerMessageKind.SET_FLOW_SESSION);
+
+    await expect(
+      noCompanyTab.waitForServerMessage(ServerMessageKind.SET_FLOW_SESSION, 1500),
+    ).rejects.toThrow(/Timed out/);
+  });
+
+  it('does not activate a flow with company-scoped hide rules on a socket whose membership is gone', async () => {
+    const severedTab = await connectOnPage(ALLOWED_PAGE);
+    await groupTo(severedTab, hhpExternalCompanyId, 'hhp');
+    const startingTab = await connectOnPage(ALLOWED_PAGE);
+    await groupTo(startingTab, chpExternalCompanyId, 'chp');
+
+    // A tab left open across an admin-side deletion still names its company but
+    // no longer has a membership resolving it, so its company attributes are
+    // unreadable even though the company row exists.
+    await severMembership(hhpExternalCompanyId);
+
+    const ack = await startingTab.sendClientMessage(ClientMessageKind.START_CONTENT, {
+      contentId: companyHideRulesFlowContentId,
+      startReason: 'start_from_manual',
+    });
+    expect(ack).toBe(true);
+    await startingTab.waitForServerMessage(ServerMessageKind.SET_FLOW_SESSION);
+
+    await expect(
+      severedTab.waitForServerMessage(ServerMessageKind.SET_FLOW_SESSION, 1500),
+    ).rejects.toThrow(/Timed out/);
+  });
+
+  // Company context only gates the fan-out for hide rules that ask about it.
+  // Content whose hide rules are page-based stays deliverable to sockets with
+  // no company — the state every socket on a site that never calls group() is
+  // permanently in.
+  it('still activates a flow whose hide rules ignore company on a socket with no company', async () => {
+    const noCompanyTab = await connectOnPage(OTHER_ALLOWED_PAGE);
+    const startingTab = await connectOnPage(ALLOWED_PAGE);
+    await groupTo(startingTab, chpExternalCompanyId, 'chp');
+
+    const ack = await startingTab.sendClientMessage(ClientMessageKind.START_CONTENT, {
+      contentId: flowContentId,
+      startReason: 'start_from_manual',
+    });
+    expect(ack).toBe(true);
+
+    await expect(
+      noCompanyTab.waitForServerMessage(ServerMessageKind.SET_FLOW_SESSION),
     ).resolves.toMatchObject({ kind: ServerMessageKind.SET_FLOW_SESSION });
   });
 });
