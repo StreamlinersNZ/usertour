@@ -17,6 +17,7 @@ import {
   filterAvailableAutoStartContentVersions,
   isActivedHideRules,
   isActivedAutoStartRules,
+  isEnabledHideRules,
   extractClientTrackConditions,
   evaluateCustomContentVersion,
   extractClientConditionWaitTimers,
@@ -57,6 +58,7 @@ import {
   EventTrackingItem,
 } from '@/common/types';
 import { DistributedLockService } from './distributed-lock.service';
+import { ConditionEvaluationService } from './condition-evaluation.service';
 import { ContentDataService } from './content-data.service';
 import { SessionBuilderService } from './session-builder.service';
 import { EventTrackingService } from './event-tracking.service';
@@ -91,6 +93,7 @@ export class ContentOrchestratorService {
     private readonly socketOperationService: SocketOperationService,
     private readonly socketDataService: SocketDataService,
     private readonly distributedLockService: DistributedLockService,
+    private readonly conditionEvaluationService: ConditionEvaluationService,
     private readonly cache: ProjectCacheService,
   ) {}
 
@@ -1471,7 +1474,59 @@ export class ContentOrchestratorService {
       return false;
     }
 
+    if (await this.hasUnresolvableCompanyHideRules(socketData, evaluatedVersion)) {
+      this.logger.debug(
+        `Skipping cross-socket activation, company-scoped hide rules for version ${session.version.id} not resolvable on this socket`,
+      );
+      return false;
+    }
+
     return !isActivedHideRules(evaluatedVersion);
+  }
+
+  /**
+   * Whether the version's hide rules ask about a company this socket cannot
+   * resolve — it is between identify() and group(), or the membership binding
+   * it to the company it names is gone.
+   *
+   * Condition evaluation answers "not matched" for company context it cannot
+   * read, which a hide rule turns into "do not hide": content scoped to one
+   * company would fan out to a tab whose own company excludes it. Treating an
+   * unanswerable hide rule as a reason to skip keeps the fan-out no more
+   * permissive than a fresh load, which the tab performs on its next message.
+   *
+   * Scoped to hide rules on purpose. Everywhere a condition grants something —
+   * auto-start targeting above all — "not matched" is the correct reading of an
+   * unresolvable company, and must stay untouched.
+   *
+   * @param socketData - The target socket's data, carrying its own company
+   * @param evaluatedVersion - The version as evaluated for that socket
+   * @returns True when the hide rules cannot be judged for this socket
+   */
+  private async hasUnresolvableCompanyHideRules(
+    socketData: SocketData,
+    evaluatedVersion: CustomContentVersion,
+  ): Promise<boolean> {
+    if (!isEnabledHideRules(evaluatedVersion)) {
+      return false;
+    }
+
+    const { environment, externalUserId, externalCompanyId } = socketData;
+    const [bizUser, attributes] = await Promise.all([
+      this.contentDataService.findBizUser(environment, externalUserId),
+      this.contentDataService.findAttributes(environment),
+    ]);
+
+    // The user backing this socket is the anchor every company-scoped condition
+    // resolves from, so its absence is the same unreadable context.
+    if (!bizUser) {
+      return true;
+    }
+
+    return await this.conditionEvaluationService.hasUnresolvableCompanyScopedConditions(
+      evaluatedVersion.config.hideRules,
+      { environment, attributes, bizUser, externalCompanyId },
+    );
   }
 
   /**
