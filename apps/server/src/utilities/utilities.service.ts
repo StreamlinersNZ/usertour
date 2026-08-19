@@ -100,9 +100,13 @@ export class UtilitiesService {
     return providers;
   }
 
-  async globalConfig() {
+  // `urls` come pre-resolved by the resolver (resolve-origin.ts: configured
+  // value first, else derived from the request). ssoCallbackUrl below stays
+  // config-only on purpose: its display must match what the OIDC runtime
+  // actually sends, not a prettier derivation of it.
+  async globalConfig(urls: { apiUrl: string; mcpServerUrl: string }) {
     const isSelfHostedMode = this.configService.get('globalConfig.isSelfHostedMode');
-    const apiUrl = this.configService.get('app.apiUrl');
+    const { apiUrl, mcpServerUrl } = urls;
     let allowUserRegistration = true;
     let allowProjectLevelSubscriptionManagement = true;
     let needsSystemAdminSetup = false;
@@ -144,6 +148,7 @@ export class UtilitiesService {
     return {
       isSelfHostedMode,
       apiUrl,
+      mcpServerUrl,
       ssoCallbackUrl: this.configService.get('app.ssoCallbackUrl'),
       allowUserRegistration,
       allowProjectLevelSubscriptionManagement,
